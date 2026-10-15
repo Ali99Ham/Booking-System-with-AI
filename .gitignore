@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.idea
+
+# Commit this sanitized template, never real credentials
+!.env
+.env
+.env.*

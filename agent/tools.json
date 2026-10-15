@@ -1,0 +1,46 @@
+[
+  {
+    "type": "function",
+    "name": "check_court_availability",
+    "description": "Get the open 60-minute court slots for a given day at Solar Club Germany. Always call this before offering times.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "description": "Day to check, formatted YYYY-MM-DD"
+        }
+      },
+      "required": ["date"]
+    }
+  },
+  {
+    "type": "function",
+    "name": "book_court",
+    "description": "Create a confirmed court booking. Only call after the caller has explicitly confirmed court, date, time, name and player count.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "full_name": { "type": "string", "description": "Caller's full name" },
+        "phone": { "type": "string", "description": "Caller's phone number" },
+        "court": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "description": "Court number 1-5"
+        },
+        "datetime_iso": {
+          "type": "string",
+          "description": "Slot start time, formatted YYYY-MM-DDTHH:00 (slots start on the hour)"
+        },
+        "players": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4,
+          "description": "Number of players, max 4"
+        }
+      },
+      "required": ["full_name", "phone", "court", "datetime_iso", "players"]
+    }
+  }
+]
