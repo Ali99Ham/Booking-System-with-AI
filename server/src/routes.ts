@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { mintClientSecret } from "./xai.js";
+import { mintClientSecret } from "./gemini.js";
 import { availabilityFor, createBooking, listBookings, subscribe, todayLocalISO } from "./store.js";
 
 export const apiRouter = Router();

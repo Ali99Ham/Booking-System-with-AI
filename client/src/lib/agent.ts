@@ -1,6 +1,14 @@
+import { Behavior, type FunctionDeclaration, type Schema, type Tool } from "@google/genai";
+
 export interface AgentConfig {
   instructions: string;
-  tools: unknown[];
+  tools: Tool[];
+}
+
+export interface LiveToken {
+  token: string;
+  model: string;
+  apiVersion: string;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -28,23 +36,48 @@ async function fetchJson(url: string): Promise<unknown> {
   return value;
 }
 
-export async function mintEphemeralToken(): Promise<string> {
+export async function mintEphemeralToken(): Promise<LiveToken> {
   const res = await fetch("/api/token", { method: "POST" });
-  const json: unknown = await res.json();
+  const json: unknown = await res.json().catch(() => ({}));
   const root = isObject(json) ? json : {};
-  const clientSecret = isObject(root.client_secret) ? root.client_secret : undefined;
-  const token: string | undefined =
-    typeof root.value === "string"
-      ? root.value
-      : typeof clientSecret?.value === "string"
-        ? clientSecret.value
-        : typeof root.client_secret === "string"
-          ? root.client_secret
-          : undefined;
-  if (!res.ok || !token) {
+  if (!res.ok || typeof root.token !== "string" || !root.token) {
     throw new Error(errorMessage(json, `Token mint failed (${res.status})`));
   }
-  return token;
+  return {
+    token: root.token,
+    model: typeof root.model === "string" ? root.model : "gemini-3.8-live",
+    apiVersion: typeof root.apiVersion === "string" ? root.apiVersion : "v1beta",
+  };
+}
+
+/** agent/tools.json uses JSON-Schema style (lowercase types); Gemini's Schema expects UPPERCASE type enums. */
+function toGeminiSchema(node: unknown): Schema {
+  if (Array.isArray(node)) return node.map(toGeminiSchema) as unknown as Schema;
+  if (!isObject(node)) return node as Schema;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "type" && typeof value === "string") out[key] = value.toUpperCase();
+    else if (key === "properties" && isObject(value)) {
+      out[key] = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, toGeminiSchema(v)]));
+    } else if (key === "items") out[key] = toGeminiSchema(value);
+    else out[key] = value;
+  }
+  return out as Schema;
+}
+
+export function toGeminiTools(rawTools: unknown[]): Tool[] {
+  const functionDeclarations: FunctionDeclaration[] = rawTools.map((raw) => {
+    if (!isObject(raw) || typeof raw.name !== "string") throw new Error("Each tool in tools.json needs a name");
+    return {
+      name: raw.name,
+      description: typeof raw.description === "string" ? raw.description : undefined,
+      parameters: raw.parameters ? toGeminiSchema(raw.parameters) : undefined,
+      // Gemini 3.8 Live defaults to NON_BLOCKING. The booking flow needs the real tool result
+      // before the model speaks, so we force the classic blocking behaviour.
+      behavior: Behavior.BLOCKING,
+    };
+  });
+  return [{ functionDeclarations }];
 }
 
 export async function fetchAgentConfig(): Promise<AgentConfig> {
@@ -65,7 +98,7 @@ export async function fetchAgentConfig(): Promise<AgentConfig> {
     ` (${localDate})`;
   return {
     instructions: template.replace("{{TODAY}}", today) + "\n\n" + knowledge,
-    tools,
+    tools: toGeminiTools(tools),
   };
 }
 

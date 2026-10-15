@@ -1,26 +1,25 @@
 import { useRef, useState } from "react";
+import { GoogleGenAI, Modality, type FunctionResponse, type LiveServerMessage, type Session } from "@google/genai";
 import { AudioQueue, openMicPump } from "../lib/audio";
 import { fetchAgentConfig, mintEphemeralToken, runTool } from "../lib/agent";
 import { useTranscript } from "./useTranscript";
 
-const REALTIME_URL = "wss://api.x.ai/v1/realtime?model=grok-voice-latest";
-const VOICE = "eve";
+/** Gemini prebuilt voice (any TTS voice name works, e.g. Kore, Puck, Aoede, Charon). */
+const VOICE = "Kore";
+/** Gemini Live always returns 16-bit PCM at 24 kHz. */
+const OUTPUT_SAMPLE_RATE = 24_000;
 const IDLE = "Idle — tap to call";
-
-type RealtimeEvent = Record<string, unknown> & { type: string };
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function stringField(value: Record<string, unknown>, key: string): string | undefined {
-  return typeof value[key] === "string" ? value[key] : undefined;
-}
-
-function parseRealtimeEvent(raw: string): RealtimeEvent | null {
-  const value: unknown = JSON.parse(raw);
-  if (!isObject(value) || typeof value.type !== "string") return null;
-  return { ...value, type: value.type };
+/** Gemini expects {output} / {error} in a function response. */
+function toFunctionResponseBody(result: unknown): Record<string, unknown> {
+  if (isObject(result) && result.ok === false) {
+    return { error: typeof result.error === "string" ? result.error : result };
+  }
+  return { output: result };
 }
 
 export function useVoiceCall() {
@@ -29,120 +28,115 @@ export function useVoiceCall() {
   const [status, setStatus] = useState(IDLE);
   const transcript = useTranscript();
 
-  const wsRef = useRef<WebSocket | null>(null);
+  const sessionRef = useRef<Session | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const micRef = useRef<MediaStream | null>(null);
   const queueRef = useRef<AudioQueue | null>(null);
   const closeMicRef = useRef<(() => void) | null>(null);
   const liveRef = useRef(false);
-  const pendingToolCallsRef = useRef(0);
-  const toolTurnActiveRef = useRef(false);
-  const toolTurnDoneRef = useRef(false);
+  /** Identifies the current call so late callbacks from an old session are ignored. */
+  const callIdRef = useRef(0);
+  const cancelledCallsRef = useRef(new Set<string>());
+  const userTurnRef = useRef<{ key: string; text: string } | null>(null);
+  const userTurnSeqRef = useRef(0);
 
-  const send = (payload: unknown) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
+  const sendToolResponse = (functionResponses: FunctionResponse[]) => {
+    try {
+      sessionRef.current?.sendToolResponse({ functionResponses });
+    } catch (err) {
+      transcript.push("sys", `⚠ Could not send tool result: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
-  const continueAfterTools = () => {
-    if (!toolTurnActiveRef.current || !toolTurnDoneRef.current || pendingToolCallsRef.current > 0) return;
-    toolTurnActiveRef.current = false;
-    toolTurnDoneRef.current = false;
-    send({ type: "response.create" });
+  const handleToolCalls = async (calls: { id?: string; name?: string; args?: Record<string, unknown> }[], callId: number) => {
+    const responses = await Promise.all(
+      calls.map(async (fc): Promise<FunctionResponse> => {
+        const name = fc.name ?? "";
+        const args = isObject(fc.args) ? fc.args : {};
+        transcript.push("tool", `⚙ ${name} ${JSON.stringify(args)}`);
+        const result = await runTool(name, args);
+        return { id: fc.id, name, response: toFunctionResponseBody(result) };
+      })
+    );
+    if (callId !== callIdRef.current) return; // call ended while tools were running
+    // Drop results for calls the server cancelled (e.g. the caller interrupted the agent).
+    const answerable = responses.filter((r) => !(r.id && cancelledCallsRef.current.has(r.id)));
+    if (answerable.length) sendToolResponse(answerable);
   };
 
-  const handleToolCall = async (name: string, callId: string, rawArguments: string) => {
-    let args: Record<string, unknown> = {};
-    try {
-      const parsed: unknown = JSON.parse(rawArguments || "{}");
-      if (isObject(parsed)) args = parsed;
-    } catch {}
-    transcript.push("tool", `⚙ ${name} ${rawArguments || "{}"}`);
-    try {
-      const output = await runTool(name, args);
-      send({
-        type: "conversation.item.create",
-        item: { type: "function_call_output", call_id: callId, output: JSON.stringify(output) },
-      });
-    } finally {
-      pendingToolCallsRef.current -= 1;
-      continueAfterTools();
-    }
+  const endUserTurn = () => {
+    userTurnRef.current = null;
   };
 
-  const handleEvent = (msg: RealtimeEvent) => {
-    switch (msg.type) {
-      case "response.output_audio.delta":
-      case "response.audio.delta": {
-        const delta = stringField(msg, "delta");
-        if (delta) queueRef.current?.enqueue(delta);
-        break;
-      }
-      case "response.output_audio_transcript.delta":
-      case "response.audio_transcript.delta": {
-        transcript.agentDelta(stringField(msg, "delta") ?? "");
-        break;
-      }
-      case "response.output_audio_transcript.done":
-      case "response.audio_transcript.done":
-        transcript.agentDone();
-        break;
-      case "conversation.item.input_audio_transcription.updated":
-      case "conversation.item.input_audio_transcription.completed": {
-        transcript.userUpdate(
-          stringField(msg, "item_id") ?? "current",
-          stringField(msg, "transcript") ?? ""
-        );
-        break;
-      }
-      case "input_audio_buffer.speech_started":
+  const handleMessage = (msg: LiveServerMessage, callId: number) => {
+    const content = msg.serverContent;
+    if (content) {
+      if (content.interrupted) {
+        // The caller barged in: drop whatever audio is still queued.
         queueRef.current?.stop();
-        break;
-      case "response.function_call_arguments.done": {
-        const name = stringField(msg, "name");
-        const callId = stringField(msg, "call_id");
-        const rawArguments = stringField(msg, "arguments") ?? "{}";
-        if (!name || !callId) {
-          transcript.push("sys", "⚠ Received an invalid tool call from xAI.");
-          break;
-        }
-        toolTurnActiveRef.current = true;
-        pendingToolCallsRef.current += 1;
-        void handleToolCall(name, callId, rawArguments);
-        break;
-      }
-      case "response.done":
         transcript.agentDone();
-        if (toolTurnActiveRef.current) {
-          toolTurnDoneRef.current = true;
-          continueAfterTools();
-        }
-        break;
-      case "error": {
-        const error = isObject(msg.error) ? msg.error : undefined;
-        const message = error ? stringField(error, "message") : undefined;
-        transcript.push("sys", `⚠ ${message ?? JSON.stringify(msg.error ?? msg)}`);
-        break;
       }
+
+      for (const part of content.modelTurn?.parts ?? []) {
+        const inline = part.inlineData;
+        if (!part.thought && inline?.data && (inline.mimeType ?? "audio/pcm").startsWith("audio/")) {
+          queueRef.current?.enqueue(inline.data);
+          endUserTurn();
+        }
+      }
+
+      const heard = content.inputTranscription?.text;
+      if (heard) {
+        // Gemini streams input transcription in fragments; accumulate them into one user line.
+        let turn = userTurnRef.current;
+        if (!turn) {
+          turn = { key: `u${++userTurnSeqRef.current}`, text: "" };
+          userTurnRef.current = turn;
+        }
+        turn.text += heard;
+        transcript.userUpdate(turn.key, turn.text.trim());
+      }
+
+      const said = content.outputTranscription?.text;
+      if (said) {
+        endUserTurn();
+        transcript.agentDelta(said);
+      }
+
+      if (content.turnComplete) {
+        transcript.agentDone();
+        endUserTurn();
+      }
+    }
+
+    const calls = msg.toolCall?.functionCalls;
+    if (calls?.length) void handleToolCalls(calls, callId);
+
+    for (const id of msg.toolCallCancellation?.ids ?? []) cancelledCallsRef.current.add(id);
+
+    if (msg.goAway) {
+      transcript.push("sys", `⚠ Gemini will end this session soon${msg.goAway.timeLeft ? ` (${msg.goAway.timeLeft} left)` : ""}.`);
     }
   };
 
   const endCall = (finalStatus = IDLE) => {
+    callIdRef.current += 1;
     liveRef.current = false;
     queueRef.current?.stop();
     queueRef.current = null;
-    wsRef.current?.close();
-    wsRef.current = null;
+    const session = sessionRef.current;
+    sessionRef.current = null;
+    try {
+      session?.close();
+    } catch {}
     closeMicRef.current?.();
     closeMicRef.current = null;
     micRef.current?.getTracks().forEach((t) => t.stop());
     micRef.current = null;
     void ctxRef.current?.close();
     ctxRef.current = null;
-    pendingToolCallsRef.current = 0;
-    toolTurnActiveRef.current = false;
-    toolTurnDoneRef.current = false;
+    cancelledCallsRef.current.clear();
+    userTurnRef.current = null;
     transcript.reset();
     setLive(false);
     setBusy(false);
@@ -150,74 +144,91 @@ export function useVoiceCall() {
   };
 
   const startCall = async () => {
+    const callId = ++callIdRef.current;
+    const stale = () => callId !== callIdRef.current;
     setBusy(true);
     setStatus("Getting line…");
     try {
-      const [token, config] = await Promise.all([mintEphemeralToken(), fetchAgentConfig()]);
+      // Mic permission can take a while on first use, so do it BEFORE minting the
+      // single-use token (which must be used shortly after it is created).
+      const [config, mic] = await Promise.all([
+        fetchAgentConfig(),
+        navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+        }),
+      ]);
+      micRef.current = mic;
+      if (stale()) return endCall();
 
-      micRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-      });
       const ctx = new AudioContext({ latencyHint: "interactive" });
       ctxRef.current = ctx;
       await ctx.resume();
-      const sampleRate = ctx.sampleRate;
-      queueRef.current = new AudioQueue(ctx, sampleRate);
+      const inputMime = `audio/pcm;rate=${ctx.sampleRate}`; // Live API resamples any input rate
+      queueRef.current = new AudioQueue(ctx, OUTPUT_SAMPLE_RATE);
 
       setStatus("Ringing…");
-      const ws = new WebSocket(REALTIME_URL, [`xai-client-secret.${token}`]);
-      wsRef.current = ws;
+      const { token, model, apiVersion } = await mintEphemeralToken();
+      if (stale()) return endCall();
 
-      ws.onopen = () => {
-        void (async () => {
-          try {
-            send({
-              type: "session.update",
-              session: {
-                voice: VOICE,
-                instructions: config.instructions,
-                turn_detection: { type: "server_vad" },
-                audio: {
-                  input: {
-                    format: { type: "audio/pcm", rate: sampleRate },
-                    transcription: { model: "grok-transcribe" },
-                  },
-                  output: { format: { type: "audio/pcm", rate: sampleRate } },
-                },
-                tools: config.tools,
-              },
-            });
-            send({ type: "response.create" });
-            const mic = micRef.current;
-            if (!mic) throw new Error("Microphone stream closed before the call connected");
-            closeMicRef.current = await openMicPump(ctx, mic, (b64) =>
-              send({ type: "input_audio_buffer.append", audio: b64 })
-            );
-            liveRef.current = true;
-            setLive(true);
-            setBusy(false);
-            setStatus("Connected — speak normally");
-          } catch (err) {
-            transcript.push("sys", `⚠ ${err instanceof Error ? err.message : String(err)}`);
-            endCall("Failed — see transcript");
-          }
-        })();
-      };
+      const ai = new GoogleGenAI({ apiKey: token, httpOptions: { apiVersion } });
+      const session = await ai.live.connect({
+        model,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          systemInstruction: config.instructions,
+          tools: config.tools,
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+        },
+        callbacks: {
+          onmessage: (msg) => {
+            if (callId === callIdRef.current) handleMessage(msg, callId);
+          },
+          onerror: (e) => {
+            if (callId !== callIdRef.current) return;
+            transcript.push("sys", `⚠ Connection error: ${e.message || "see the browser console"}`);
+          },
+          onclose: (e) => {
+            if (callId !== callIdRef.current) return;
+            const reason = e.reason ? ` (${e.reason})` : e.code && e.code !== 1000 ? ` (code ${e.code})` : "";
+            if (!liveRef.current) transcript.push("sys", `⚠ Gemini closed the connection${reason}. Check GEMINI_API_KEY and GEMINI_LIVE_MODEL.`);
+            endCall(liveRef.current ? `Call ended${reason}` : "Connection failed");
+          },
+        },
+      });
+      if (stale()) {
+        session.close();
+        return endCall();
+      }
+      sessionRef.current = session;
 
-      ws.onmessage = (ev) => {
-        if (typeof ev.data !== "string") return;
+      // Gemini Live has no "response.create": nudge the model to pick up the phone first.
+      const localTime = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+      session.sendClientContent({
+        turns: [
+          {
+            role: "user",
+            parts: [{ text: `[The phone call has just connected. Local time is ${localTime}. Answer the phone now with your opening greeting.]` }],
+          },
+        ],
+        turnComplete: true,
+      });
+
+      closeMicRef.current = await openMicPump(ctx, mic, (b64) => {
         try {
-          const event = parseRealtimeEvent(ev.data);
-          if (event) handleEvent(event);
-        } catch {}
-      };
-
-      ws.onerror = () =>
-        transcript.push("sys", "⚠ WebSocket error — check the console and your XAI_API_KEY.");
-      ws.onclose = () => {
-        if (wsRef.current === ws) endCall(liveRef.current ? "Call ended" : "Connection failed");
-      };
+          sessionRef.current?.sendRealtimeInput({ audio: { data: b64, mimeType: inputMime } });
+        } catch {
+          /* socket closing — onclose handles the cleanup */
+        }
+      });
+      if (stale()) return endCall();
+      liveRef.current = true;
+      setLive(true);
+      setBusy(false);
+      setStatus("Connected — speak normally");
     } catch (err) {
+      if (stale()) return;
       transcript.push("sys", `⚠ ${err instanceof Error ? err.message : String(err)}`);
       endCall("Failed — see transcript");
     }
