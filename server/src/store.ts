@@ -126,7 +126,7 @@ export function seed() {
   const today = todayLocalISO();
   const rows: BookingInput[] = [
     {
-      name: "Ali Hamdan",
+      name: "Ali",
       phone: "+49000000000",
       court: 1,
       datetime_iso: `${today}T07:00`,
